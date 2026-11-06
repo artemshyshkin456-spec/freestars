@@ -91,6 +91,16 @@ class TikTok(StatesGroup):
     photo = State()
 
 
+class PromoForm(StatesGroup):
+    code = State()
+
+
+class AddPromo(StatesGroup):
+    code = State()
+    reward = State()
+    uses = State()
+
+
 # ============================================================ ХЕЛПЕРЫ
 def btn(text: str, data: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text=text, callback_data=data)
@@ -195,6 +205,7 @@ def main_menu(uid: int) -> InlineKeyboardMarkup:
         [btn("💰 Заработать звёзды", "earn")],
         [btn("👤 Профиль", "profile"), btn("👥 Пригласить друзей", "invite")],
         [btn("🎵 Коментарии TikTok", "tiktok")],
+        [btn("🎰 Крутилка", "spin"), btn("🎁 Промокод", "promo")],
         [btn("🛒 Купить подписчиков", "buy")],
         [btn("💸 Вывести звёзды", "withdraw")],
     ]
@@ -239,7 +250,6 @@ class Guard(BaseMiddleware):
 
 
 async def clear_state_user(handler, event, data):
-    # шаги покупки и tiktok используют FSM-данные, поэтому их не сбрасываем
     if not (event.data or "").startswith(("buyt:", "buyq:", "tt:")):
         await data["state"].clear()
     return await handler(event, data)
@@ -272,8 +282,7 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
         return
     if is_new and credited:
         await safe_send(
-            message.bot,
-            credited,
+            message.bot, credited,
             f"🎉 По твоей ссылке пришёл новый пользователь! Начислено <b>{fmt(REF_REWARD)}⭐</b>",
         )
     await message.answer(main_text(u.id), reply_markup=main_menu(u.id))
@@ -294,8 +303,12 @@ async def cb_profile(cb: CallbackQuery):
         f"💰 Баланс: <b>{fmt(info[0])}⭐</b>\n"
         f"✅ Выполнено заданий: <b>{db.approved_count(cb.from_user.id)}</b>\n"
         f"⏳ На проверке: <b>{db.pending_count(cb.from_user.id)}</b>\n"
-        f"👥 Приглашено друзей: <b>{info[1]}</b>"
+        f"👥 Приглашено друзей: <b>{info[1]}</b>\n"
+        f"👥 Рефералы 2-го уровня: <b>{info[3]}</b>"  # info[3]=l2_ref_count
     )
+    pend_wd = db.user_pending_withdrawal(cb.from_user.id)
+    if pend_wd:
+        text += f"\n\n⏳ <b>Заявка #{pend_wd[0]}</b> на <b>{fmt(pend_wd[1])}⭐</b> ожидает выплаты."
     if db.withdraw_blocked(cb.from_user.id):
         text += "\n\n🔒 <b>Вывод заблокирован</b> (отписка от канала). Обратись к администратору."
     await show(cb, text, back_menu())
@@ -306,10 +319,11 @@ async def cb_invite(cb: CallbackQuery):
     link = f"https://t.me/{BOT_USERNAME}?start=ref_{cb.from_user.id}"
     text = (
         "👥 <b>Приглашай друзей</b>\n\n"
-        f"За каждого нового пользователя — <b>{fmt(REF_REWARD)}⭐</b>.\n\n"
+        f"За каждого нового — <b>{fmt(REF_REWARD)}⭐</b>.\n"
+        f"За реферала твоего реферала — <b>{db.L2_REWARD / 100:.2f}⭐</b> (2-й уровень).\n\n"
         f"Твоя ссылка:\n<code>{link}</code>"
     )
-    await show(cb, text, back_menu())
+    await show(cb, text, kb([btn("🏆 Топ рефералов", "top_refs")], [btn("⬅️ Назад", "menu")]))
 
 
 @router.callback_query(F.data == "withdraw")
@@ -337,8 +351,7 @@ async def cb_withdraw(cb: CallbackQuery):
     )
     u = cb.from_user
     await safe_send(
-        cb.bot,
-        ADMIN_ID,
+        cb.bot, ADMIN_ID,
         f"💸 Заявка <b>#{wid}</b>\nПользователь: {user_label(u.id, u.username, u.first_name)}\n"
         f"Сумма: <b>{fmt(amount)}⭐</b>",
         reply_markup=kb([btn("✅ Выплачено", f"wd:ok:{wid}"), btn("❌ Отклонить", f"wd:no:{wid}")]),
@@ -347,7 +360,6 @@ async def cb_withdraw(cb: CallbackQuery):
 
 # ---------------------------------------------------------------- задания
 def task_view(tid: int, kind: str, url: str, chat_id, need_tasks: int = 2):
-    """Текст и кнопки одного задания."""
     if kind == "channel":
         if chat_id:
             text = (
@@ -376,7 +388,6 @@ def task_view(tid: int, kind: str, url: str, chat_id, need_tasks: int = 2):
 
 
 async def show_earn(cb: CallbackQuery, note: str = ""):
-    """Показывает ОДНО следующее задание (по порядку)."""
     uid = cb.from_user.id
     pend = db.pending_count(uid)
     prefix = f"{note}\n\n" if note else ""
@@ -432,11 +443,8 @@ async def cb_proof_start(cb: CallbackQuery, state: FSMContext):
         return await show_earn(cb, "⚠️ Это задание уже недоступно.")
     await state.set_state(Proof.photo)
     await state.update_data(task_id=tid)
-    await show(
-        cb,
-        f"📸 Отправь <b>скриншот</b> выполнения задания #{tid} (одним фото).",
-        kb([btn("❌ Отмена", "earn")]),
-    )
+    await show(cb, f"📸 Отправь <b>скриншот</b> выполнения задания #{tid} (одним фото).",
+               kb([btn("❌ Отмена", "earn")]))
 
 
 @router.message(Proof.photo, F.photo)
@@ -448,6 +456,11 @@ async def msg_proof(message: Message, state: FSMContext):
     if not isinstance(tid, int):
         return await message.answer("Начни заново.", reply_markup=main_menu(u.id))
     file_id = message.photo[-1].file_id
+    if db.proof_duplicate(file_id):
+        return await message.answer(
+            "⚠️ Этот скриншот уже был отправлен ранее. Пришли другой скриншот.",
+            reply_markup=main_menu(u.id),
+        )
     res, utid = db.submit_proof(u.id, tid, file_id)
     texts = {
         "inactive": "⚠️ Задание уже закрыто.",
@@ -464,8 +477,8 @@ async def msg_proof(message: Message, state: FSMContext):
     )
     task = db.get_task(tid)
     await send_proof_to_admin(
-        message.bot, utid, u.id, u.username, u.first_name, tid, task[1] if task else "bot",
-        task[2] if task else "", file_id,
+        message.bot, utid, u.id, u.username, u.first_name, tid,
+        task[1] if task else "bot", task[2] if task else "", file_id,
     )
 
 
@@ -489,7 +502,7 @@ async def send_proof_to_admin(bot: Bot, utid, uid, username, first_name, tid, ki
 
 
 # ---------------------------------------------------------------- TikTok комментарии
-TIKTOK_REWARD = 10   # сотых доли звезды за 1 комментарий (= 0.10⭐)
+TIKTOK_REWARD = 10
 TIKTOK_TEXTS = [
     "Забрал 25⭐ тут @StarDropEarn_Bot 🔥 Реально платит!",
     "Только что вывел 25 звёзд в @StarDropEarn_Bot ⭐ Советую всем!",
@@ -520,10 +533,7 @@ async def cb_tiktok(cb: CallbackQuery):
         "👇 <b>Нажми на текст — он скопируется. Вставь его комментарием под видео:</b>\n\n"
         + texts
     )
-    await show(cb, text, kb(
-        [btn("📸 Отправить скриншот", "tt:send")],
-        [btn("⬅️ Назад", "menu")],
-    ))
+    await show(cb, text, kb([btn("📸 Отправить скриншот", "tt:send")], [btn("⬅️ Назад", "menu")]))
 
 
 @router.callback_query(F.data == "tt:send")
@@ -548,23 +558,22 @@ async def msg_tiktok_proof(message: Message, state: FSMContext):
             "⚠️ Слишком много заданий на проверке (максимум 5). Дождись проверки.",
             reply_markup=main_menu(u.id),
         )
+    if db.tiktok_duplicate(file_id):
+        return await message.answer(
+            "⚠️ Этот скриншот уже был отправлен ранее. Пришли другой скриншот.",
+            reply_markup=main_menu(u.id),
+        )
     utid = db.submit_tiktok(u.id, file_id)
     await message.answer(
         "✅ Скриншот отправлен на проверку. После одобрения "
         f"<b>{TIKTOK_REWARD / 100:.2f}⭐</b> придут на баланс.",
         reply_markup=main_menu(u.id),
     )
-    caption = (
-        f"🎵 TikTok-скриншот <b>#{utid}</b>\n"
-        f"От: {user_label(u.id, u.username, u.first_name)}"
-    )
+    caption = f"🎵 TikTok-скриншот <b>#{utid}</b>\nОт: {user_label(u.id, u.username, u.first_name)}"
     try:
         await message.bot.send_photo(
             ADMIN_ID, file_id, caption=caption,
-            reply_markup=kb([
-                btn("✅ Принять", f"tt:ok:{utid}"),
-                btn("❌ Отклонить", f"tt:no:{utid}"),
-            ]),
+            reply_markup=kb([btn("✅ Принять", f"tt:ok:{utid}"), btn("❌ Отклонить", f"tt:no:{utid}")]),
         )
     except TelegramAPIError:
         log.exception("Не удалось отправить TikTok-скриншот админу")
@@ -605,6 +614,77 @@ async def cb_tiktok_resolve(cb: CallbackQuery):
     await cb.answer("Готово")
 
 
+# ---------------------------------------------------------------- крутилка
+SPIN_EMOJI = {0: "😔", 5: "🌟", 10: "⭐", 50: "🔥"}
+
+
+@router.callback_query(F.data == "spin")
+async def cb_spin(cb: CallbackQuery):
+    uid = cb.from_user.id
+    wait = db.spin_available(uid)
+    if wait > 0:
+        h, m = divmod(wait // 60, 60)
+        await show(
+            cb,
+            f"🎰 <b>Крутилка</b>\n\nСледующее кручение через: <b>{h}ч {m}м</b>\n\n"
+            f"Призы: 0.05⭐ · 0.10⭐ · 0.50⭐ · ничего\n"
+            f"Шанс: ничего > 0.05⭐ > 0.10⭐ > 0.50⭐",
+            kb([btn("⬅️ Назад", "menu")]),
+        )
+        return
+    ok, prize = db.do_spin(uid)
+    if not ok:
+        h, m = divmod(prize // 60, 60)
+        return await show(cb, f"🎰 Следующее кручение через <b>{h}ч {m}м</b>.", back_menu())
+    emoji = SPIN_EMOJI.get(prize, "🎰")
+    if prize == 0:
+        text = f"🎰 <b>Крутилка</b>\n\n{emoji} Не повезло — ничего не выпало.\nПриходи завтра!"
+    else:
+        text = (
+            f"🎰 <b>Крутилка</b>\n\n{emoji} Поздравляем! Выпало <b>{fmt(prize)}⭐</b>!\n"
+            "Звёзды зачислены на баланс."
+        )
+    await show(cb, text, kb([btn("⬅️ В меню", "menu")]))
+
+
+# ---------------------------------------------------------------- промокод
+@router.callback_query(F.data == "promo")
+async def cb_promo(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(PromoForm.code)
+    await show(cb, "🎁 <b>Промокод</b>\n\nОтправь промокод:", kb([btn("❌ Отмена", "menu")]))
+
+
+@router.message(PromoForm.code)
+async def msg_promo(message: Message, state: FSMContext):
+    await state.clear()
+    code = (message.text or "").strip()
+    if not code or len(code) > 30:
+        return await message.answer("❌ Неверный промокод.", reply_markup=main_menu(message.from_user.id))
+    status, reward = db.use_promo(message.from_user.id, code)
+    msgs = {
+        "ok": f"✅ Промокод принят! Начислено <b>{fmt(reward)}⭐</b>.",
+        "notfound": "❌ Промокод не найден.",
+        "used": "❌ Ты уже использовал этот промокод.",
+        "expired": "❌ Промокод больше не действует (лимит исчерпан).",
+    }
+    await message.answer(msgs.get(status, "❌ Ошибка."), reply_markup=main_menu(message.from_user.id))
+
+
+# ---------------------------------------------------------------- топ рефералов
+@router.callback_query(F.data == "top_refs")
+async def cb_top_refs(cb: CallbackQuery):
+    rows = db.top_refs(10)
+    if not rows:
+        return await show(cb, "👥 <b>Топ рефералов</b>\n\nПока никто не пригласил друзей.", back_menu())
+    lines = ["👥 <b>Топ рефералов</b>\n"]
+    medals = ["🥇", "🥈", "🥉"] + ["4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    for i, (uid, username, first_name, ref_count) in enumerate(rows):
+        medal = medals[i] if i < len(medals) else f"{i+1}."
+        who = f"@{escape(username)}" if username else escape(first_name or str(uid))
+        lines.append(f"{medal} {who} — <b>{ref_count}</b> реф.")
+    await show(cb, "\n".join(lines), back_menu())
+
+
 # ---------------------------------------------------------------- покупка подписчиков
 PUBLIC_RE = re.compile(r"https://t\.me/([A-Za-z][A-Za-z0-9_]{3,31})/?")
 
@@ -642,9 +722,7 @@ def qty_markup() -> InlineKeyboardMarkup:
 async def ask_qty(message: Message, state: FSMContext, kind: str):
     await state.set_state(None)
     who = "подписчиков" if kind == "channel" else "пользователей"
-    await message.answer(
-        f"Сколько {who} купить?\n1 = 1⭐. Выбери пакет:", reply_markup=qty_markup()
-    )
+    await message.answer(f"Сколько {who} купить?\n1 = 1⭐. Выбери пакет:", reply_markup=qty_markup())
 
 
 @router.callback_query(F.data == "buy")
@@ -653,10 +731,7 @@ async def cb_buy(cb: CallbackQuery):
     await show(
         cb,
         f"🛒 <b>Купить подписчиков</b>\n\n1 подписчик = 1⭐. Пакеты: {opts}.\nКуда нужны подписчики?",
-        kb(
-            [btn("📢 В канал", "buy:channel"), btn("🤖 В бота", "buy:bot")],
-            [btn("⬅️ Назад", "menu")],
-        ),
+        kb([btn("📢 В канал", "buy:channel"), btn("🤖 В бота", "buy:bot")], [btn("⬅️ Назад", "menu")]),
     )
 
 
@@ -750,16 +825,10 @@ async def cb_buy_qty(cb: CallbackQuery, state: FSMContext):
     if qty not in BUY_OPTIONS or kind not in ("channel", "bot") or not url:
         await state.clear()
         return await show(cb, "⚠️ Начни заново.", kb([btn("🛒 Купить", "buy")], [btn("⬅️ В меню", "menu")]))
-    oid = db.create_order(
-        cb.from_user.id, kind, url, data.get("chat_id"), int(data.get("need_tasks", 0)), qty
-    )
+    oid = db.create_order(cb.from_user.id, kind, url, data.get("chat_id"), int(data.get("need_tasks", 0)), qty)
     await state.clear()
     if oid is None:
-        return await show(
-            cb,
-            "⚠️ У тебя уже 2 заявки на проверке. Дождись решения администратора.",
-            back_menu(),
-        )
+        return await show(cb, "⚠️ У тебя уже 2 заявки на проверке. Дождись решения администратора.", back_menu())
     what = "Канал" if kind == "channel" else "Бот"
     text = (
         f"🧾 <b>Заказ #{oid}</b>\n{what}: {escape(url)}\nКоличество: <b>{qty}</b>\n"
@@ -805,9 +874,7 @@ async def notify_order_admin(bot: Bot, oid: int):
         lines.append("Задания в боте: " + ("нужно выполнить" if need else "достаточно /start"))
     lines.append(f"Количество: <b>{qty}</b> → оплата <b>{qty}⭐</b> на {escape(PAY_ACCOUNT)}")
     await safe_send(
-        bot,
-        ADMIN_ID,
-        "\n".join(lines),
+        bot, ADMIN_ID, "\n".join(lines),
         reply_markup=kb([btn("✅ Оплата пришла", f"ord:ok:{oid}"), btn("❌ Не пришла", f"ord:no:{oid}")]),
     )
 
@@ -820,8 +887,9 @@ def admin_menu() -> InlineKeyboardMarkup:
         [btn("📸 Проверка скриншотов", "adm:proofs")],
         [btn("🛒 Заявки на покупку", "adm:orders"), btn("💰 Баланс пользователей", "adm:bal")],
         [btn("🎵 TikTok скриншоты", "adm:tiktoks")],
+        [btn("🎁 Промокоды", "adm:promos"), btn("📢 Реклама", "adm:ads")],
         [btn("➕ Добавить задание", "adm:add"), btn("📋 Задания / убрать", "adm:tasks")],
-        [btn("📢 Реклама", "adm:ads"), btn("🚫 Бан / разбан", "adm:bans")],
+        [btn("🚫 Бан / разбан", "adm:bans")],
         [btn("⬅️ В меню", "menu")],
     )
 
@@ -856,7 +924,7 @@ async def cb_stats(cb: CallbackQuery):
     text = (
         "📊 <b>Статистика</b>\n\n"
         f"Пользователей: <b>{s['users']}</b> (заблокировано: {s['banned']})\n"
-        f"Суммарный баланс пользователей: <b>{fmt(s['balances'])}⭐</b>\n"
+        f"Суммарный баланс: <b>{fmt(s['balances'])}⭐</b>\n"
         f"Невыполненных выплат: <b>{s['wd_pending'][0]}</b> на <b>{fmt(s['wd_pending'][1])}⭐</b>\n"
         f"Выплачено: <b>{s['wd_paid'][0]}</b> на <b>{fmt(s['wd_paid'][1])}⭐</b>\n"
         f"Активных заданий: <b>{s['tasks']}</b>\n"
@@ -886,13 +954,12 @@ async def cb_pending_wd(cb: CallbackQuery):
     rows = db.pending_withdrawals(10)
     if not rows:
         return await show(cb, "⏳ Невыполненных выплат нет.", to_panel())
-    await show(cb, f"⏳ Невыполненных выплат показано: <b>{len(rows)}</b> (сообщения ниже).", to_panel())
+    await show(cb, f"⏳ Невыполненных выплат: <b>{len(rows)}</b> (сообщения ниже).", to_panel())
     for wid, uid, username, first_name, amount, created in rows:
         await safe_send(
-            cb.bot,
-            ADMIN_ID,
-            f"💸 Заявка <b>#{wid}</b> от {tm(created)}\nПользователь: "
-            f"{user_label(uid, username, first_name)}\nСумма: <b>{fmt(amount)}⭐</b>",
+            cb.bot, ADMIN_ID,
+            f"💸 Заявка <b>#{wid}</b> от {tm(created)}\n"
+            f"Пользователь: {user_label(uid, username, first_name)}\nСумма: <b>{fmt(amount)}⭐</b>",
             reply_markup=kb([btn("✅ Выплачено", f"wd:ok:{wid}"), btn("❌ Отклонить", f"wd:no:{wid}")]),
         )
 
@@ -912,9 +979,7 @@ async def cb_wd_resolve(cb: CallbackQuery):
     if approve:
         await safe_send(cb.bot, user_id, f"✅ Выплата <b>{fmt(amount)}⭐</b> по заявке #{wid} отправлена!")
     else:
-        await safe_send(
-            cb.bot, user_id, f"❌ Заявка #{wid} отклонена, <b>{fmt(amount)}⭐</b> возвращены на баланс."
-        )
+        await safe_send(cb.bot, user_id, f"❌ Заявка #{wid} отклонена, <b>{fmt(amount)}⭐</b> возвращены на баланс.")
     await cb.answer("Готово")
 
 
@@ -923,7 +988,7 @@ async def cb_proofs(cb: CallbackQuery):
     rows = db.pending_proofs(5)
     if not rows:
         return await show(cb, "📸 Скриншотов на проверке нет.", to_panel())
-    await show(cb, f"📸 Показано скриншотов: <b>{len(rows)}</b> (сообщения ниже).", to_panel())
+    await show(cb, f"📸 Показано: <b>{len(rows)}</b> (сообщения ниже).", to_panel())
     for utid, uid, username, first_name, tid, kind, url, file_id in rows:
         await send_proof_to_admin(cb.bot, utid, uid, username, first_name, tid, kind, url, file_id)
 
@@ -940,9 +1005,7 @@ async def cb_proof_resolve(cb: CallbackQuery):
     user_id, tid = row
     await mark_done(cb, "✅ Принято" if approve else "❌ Отклонено")
     if approve:
-        await safe_send(
-            cb.bot, user_id, f"✅ Задание #{tid} принято! Начислено <b>{fmt(TASK_REWARD)}⭐</b>"
-        )
+        await safe_send(cb.bot, user_id, f"✅ Задание #{tid} принято! Начислено <b>{fmt(TASK_REWARD)}⭐</b>")
     else:
         await safe_send(cb.bot, user_id, f"❌ Задание #{tid} не принято. Попробуй выполнить его заново.")
     await cb.answer("Готово")
@@ -956,17 +1019,11 @@ async def cb_adm_tiktoks(cb: CallbackQuery):
         return await show(cb, "🎵 TikTok-скриншотов на проверке нет.", to_panel())
     await show(cb, f"🎵 TikTok-скриншотов: <b>{len(rows)}</b> (сообщения ниже).", to_panel())
     for utid, uid, username, first_name, file_id in rows:
-        caption = (
-            f"🎵 TikTok-скриншот <b>#{utid}</b>\n"
-            f"От: {user_label(uid, username, first_name)}"
-        )
+        caption = f"🎵 TikTok-скриншот <b>#{utid}</b>\nОт: {user_label(uid, username, first_name)}"
         try:
             await cb.bot.send_photo(
                 ADMIN_ID, file_id, caption=caption,
-                reply_markup=kb([
-                    btn("✅ Принять", f"tt:ok:{utid}"),
-                    btn("❌ Отклонить", f"tt:no:{utid}"),
-                ]),
+                reply_markup=kb([btn("✅ Принять", f"tt:ok:{utid}"), btn("❌ Отклонить", f"tt:no:{utid}")]),
             )
         except TelegramAPIError:
             log.exception("Не удалось отправить TikTok-скриншот")
@@ -978,7 +1035,7 @@ async def cb_orders(cb: CallbackQuery):
     ids = db.waiting_orders(10)
     if not ids:
         return await show(cb, "🛒 Заявок на покупку нет.", to_panel())
-    await show(cb, f"🛒 Заявок на проверке: <b>{len(ids)}</b> (сообщения ниже).", to_panel())
+    await show(cb, f"🛒 Заявок: <b>{len(ids)}</b> (сообщения ниже).", to_panel())
     for oid in ids:
         await notify_order_admin(cb.bot, oid)
 
@@ -996,37 +1053,26 @@ async def cb_order_resolve(cb: CallbackQuery):
         user_id, tid, qty, kind, url, merged = res
         note = f"лимит задания #{tid} увеличен на {qty}" if merged else f"добавлено задание #{tid}"
         await mark_done(cb, f"✅ Оплата подтверждена, {note}")
-        await safe_send(
-            cb.bot,
-            user_id,
+        await safe_send(cb.bot, user_id,
             f"✅ Оплата по заказу #{oid} подтверждена! Твоя ссылка добавлена в задания "
-            f"({qty} {'подписчиков' if kind == 'channel' else 'пользователей'}).",
-        )
+            f"({qty} {'подписчиков' if kind == 'channel' else 'пользователей'}).")
     else:
         user_id = db.reject_order(oid)
         if user_id is None:
             return await cb.answer("Заявка уже обработана", show_alert=True)
         await mark_done(cb, "❌ Оплата не подтверждена")
-        await safe_send(
-            cb.bot,
-            user_id,
-            f"❌ Оплата по заказу #{oid} не подтверждена. Если ты платил — напиши администратору.",
-        )
+        await safe_send(cb.bot, user_id,
+            f"❌ Оплата по заказу #{oid} не подтверждена. Если ты платил — напиши администратору.")
     await cb.answer("Готово")
 
 
 # ---------------------------------------------------------------- баланс пользователей
 @admin_router.callback_query(F.data == "adm:bal")
 async def cb_bal(cb: CallbackQuery):
-    await show(
-        cb,
-        "💰 <b>Баланс пользователей</b>",
-        kb(
-            [btn("➕ Выдать звёзды", "adm:balg"), btn("➖ Забрать звёзды", "adm:balt")],
-            [btn("🔓 Снять блок вывода", "adm:balu")],
-            [btn("⬅️ В админ-панель", "adm")],
-        ),
-    )
+    await show(cb, "💰 <b>Баланс пользователей</b>",
+               kb([btn("➕ Выдать звёзды", "adm:balg"), btn("➖ Забрать звёзды", "adm:balt")],
+                  [btn("🔓 Снять блок вывода", "adm:balu")],
+                  [btn("⬅️ В админ-панель", "adm")]))
 
 
 @admin_router.callback_query(F.data.in_({"adm:balg", "adm:balt", "adm:balu"}))
@@ -1080,20 +1126,16 @@ async def msg_bal_amount(message: Message, state: FSMContext):
         return await message.answer("❌ Пользователь не найден.", reply_markup=admin_menu())
     if status == "insufficient":
         return await message.answer(
-            f"❌ У пользователя только {fmt(bal)}⭐, забрать {fmt(amount)}⭐ нельзя.",
-            reply_markup=admin_menu(),
-        )
+            f"❌ У пользователя только {fmt(bal)}⭐, забрать {fmt(amount)}⭐ нельзя.", reply_markup=admin_menu())
     if mode == "give":
         await message.answer(
             f"✅ Выдано <b>{fmt(amount)}⭐</b>. Баланс <code>{uid}</code>: <b>{fmt(bal)}⭐</b>",
-            reply_markup=admin_menu(),
-        )
+            reply_markup=admin_menu())
         await safe_send(message.bot, uid, f"🎁 Администратор начислил тебе <b>{fmt(amount)}⭐</b>.")
     else:
         await message.answer(
             f"✅ Списано <b>{fmt(amount)}⭐</b>. Баланс <code>{uid}</code>: <b>{fmt(bal)}⭐</b>",
-            reply_markup=admin_menu(),
-        )
+            reply_markup=admin_menu())
         await safe_send(message.bot, uid, f"➖ Администратор списал с твоего баланса <b>{fmt(amount)}⭐</b>.")
 
 
@@ -1107,14 +1149,84 @@ async def cb_unblock(cb: CallbackQuery):
     await cb.answer("Готово")
 
 
+# ---------------------------------------------------------------- промокоды (админ)
+@admin_router.callback_query(F.data == "adm:promos")
+async def cb_adm_promos(cb: CallbackQuery):
+    promos = db.list_promos()
+    rows = []
+    for code, reward, uses_left, created in promos:
+        rows.append([btn(f"🗑 {code} · {fmt(reward)}⭐ · осталось {uses_left}", f"adm:promodl:{code}")])
+    rows.append([btn("➕ Новый промокод", "adm:promonew")])
+    rows.append([btn("⬅️ В админ-панель", "adm")])
+    await show(cb, f"🎁 <b>Промокоды</b>\n\nАктивных: <b>{len(promos)}</b>", kb(*rows))
+
+
+@admin_router.callback_query(F.data == "adm:promonew")
+async def cb_promo_new(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(AddPromo.code)
+    await show(cb, "Введи код промокода (латиница, цифры, до 20 символов):",
+               kb([btn("❌ Отмена", "adm:promos")]))
+
+
+@admin_router.message(AddPromo.code)
+async def msg_promo_code(message: Message, state: FSMContext):
+    if is_cmd(message):
+        return await cancel_flow(message, state)
+    code = (message.text or "").strip().upper()
+    if not code or len(code) > 20 or not code.replace("_", "").replace("-", "").isalnum():
+        return await message.answer("❌ Только буквы, цифры, _ и - (до 20 символов).")
+    await state.update_data(code=code)
+    await state.set_state(AddPromo.reward)
+    await message.answer("Сколько ⭐ начислять? (например 1 или 0.5):")
+
+
+@admin_router.message(AddPromo.reward)
+async def msg_promo_reward(message: Message, state: FSMContext):
+    if is_cmd(message):
+        return await cancel_flow(message, state)
+    reward = db.parse_amount(message.text or "")
+    if reward is None:
+        return await message.answer("❌ Введи число (например 1 или 0.5).")
+    await state.update_data(reward=reward)
+    await state.set_state(AddPromo.uses)
+    await message.answer("Сколько раз можно использовать? (число):")
+
+
+@admin_router.message(AddPromo.uses)
+async def msg_promo_uses(message: Message, state: FSMContext):
+    if is_cmd(message):
+        return await cancel_flow(message, state)
+    text = (message.text or "").strip()
+    if not text.isdigit() or not (1 <= int(text) <= 100000):
+        return await message.answer("❌ Введи число от 1 до 100000.")
+    data = await state.get_data()
+    await state.clear()
+    ok = db.create_promo(data["code"], data["reward"], int(text))
+    if ok:
+        await message.answer(
+            f"✅ Промокод <b>{data['code']}</b> создан.\n"
+            f"Награда: <b>{fmt(data['reward'])}⭐</b>, использований: <b>{text}</b>.",
+            reply_markup=admin_menu())
+    else:
+        await message.answer("❌ Такой промокод уже существует.", reply_markup=admin_menu())
+
+
+@admin_router.callback_query(F.data.startswith("adm:promodl:"))
+async def cb_promo_delete(cb: CallbackQuery):
+    code = (cb.data or "").split("adm:promodl:", 1)[-1].upper()
+    if not code or len(code) > 20:
+        return await cb.answer()
+    ok = db.delete_promo(code)
+    await show(cb, f"🗑 Промокод <b>{escape(code)}</b> {'удалён.' if ok else 'не найден.'}",
+               kb([btn("⬅️ К промокодам", "adm:promos")]))
+
+
 # ---------------------------------------------------------------- бан
 @admin_router.callback_query(F.data == "adm:bans")
 async def cb_bans(cb: CallbackQuery):
-    await show(
-        cb,
-        "🚫 <b>Бан / разбан</b>",
-        kb([btn("🚫 Забанить", "adm:ban"), btn("♻️ Разбанить", "adm:unban")], [btn("⬅️ В админ-панель", "adm")]),
-    )
+    await show(cb, "🚫 <b>Бан / разбан</b>",
+               kb([btn("🚫 Забанить", "adm:ban"), btn("♻️ Разбанить", "adm:unban")],
+                  [btn("⬅️ В админ-панель", "adm")]))
 
 
 @admin_router.callback_query(F.data.in_({"adm:ban", "adm:unban"}))
@@ -1139,21 +1251,15 @@ async def msg_ban(message: Message, state: FSMContext):
     ok = db.set_ban(uid, ban)
     await message.answer(
         (("🚫 Забанен" if ban else "♻️ Разбанен") + f": <code>{uid}</code>") if ok else "❌ Пользователь не найден.",
-        reply_markup=admin_menu(),
-    )
+        reply_markup=admin_menu())
 
 
 # ---------------------------------------------------------------- добавить / убрать задание
 @admin_router.callback_query(F.data == "adm:add")
 async def cb_add(cb: CallbackQuery):
-    await show(
-        cb,
-        "➕ <b>Что добавляем?</b>",
-        kb(
-            [btn("📢 Канал", "adm:addk:channel"), btn("🤖 Бот", "adm:addk:bot")],
-            [btn("⬅️ В админ-панель", "adm")],
-        ),
-    )
+    await show(cb, "➕ <b>Что добавляем?</b>",
+               kb([btn("📢 Канал", "adm:addk:channel"), btn("🤖 Бот", "adm:addk:bot")],
+                  [btn("⬅️ В админ-панель", "adm")]))
 
 
 @admin_router.callback_query(F.data.in_({"adm:addk:channel", "adm:addk:bot"}))
@@ -1161,11 +1267,8 @@ async def cb_add_kind(cb: CallbackQuery, state: FSMContext):
     kind = cb.data.split(":")[2]
     await state.set_state(AddTask.url)
     await state.update_data(kind=kind)
-    await show(
-        cb,
-        f"{kind_title(kind)}\n\nОтправь реферальную ссылку (https://t.me/...).",
-        kb([btn("❌ Отмена", "adm")]),
-    )
+    await show(cb, f"{kind_title(kind)}\n\nОтправь реферальную ссылку (https://t.me/...).",
+               kb([btn("❌ Отмена", "adm")]))
 
 
 @admin_router.message(AddTask.url)
@@ -1237,8 +1340,7 @@ async def msg_add_chat(message: Message, state: FSMContext):
         return await message.answer("❌ Такая ссылка уже есть.", reply_markup=admin_menu())
     mode = "автопроверка подписки" if chat_id else "проверка по скриншотам"
     await message.answer(
-        f"✅ Канал #{tid} добавлен, лимит: <b>{data['target']}</b>, {mode}.", reply_markup=admin_menu()
-    )
+        f"✅ Канал #{tid} добавлен, лимит: <b>{data['target']}</b>, {mode}.", reply_markup=admin_menu())
 
 
 @admin_router.callback_query(F.data == "adm:tasks")
@@ -1250,7 +1352,7 @@ async def cb_tasks(cb: CallbackQuery):
     for tid, kind, url, chat_id, target, done in tasks[:40]:
         rows.append([btn(f"{kind_title(kind)} #{tid} · {done}/{target}", f"adm:task:{tid}")])
     rows.append([btn("⬅️ В админ-панель", "adm")])
-    await show(cb, f"📋 <b>Активные задания</b> ({len(tasks)}). Нажми, чтобы открыть.", kb(*rows))
+    await show(cb, f"📋 <b>Активные задания</b> ({len(tasks)}).", kb(*rows))
 
 
 @admin_router.callback_query(F.data.startswith("adm:task:"))
@@ -1278,20 +1380,16 @@ async def cb_task_del(cb: CallbackQuery):
     tid = tail_int(cb.data)
     if not tid:
         return await cb.answer()
-    await show(
-        cb,
-        f"Убрать задание #{tid} из списка?",
-        kb([btn("✅ Да, убрать", f"adm:tdelc:{tid}"), btn("↩️ Нет", f"adm:task:{tid}")]),
-    )
+    await show(cb, f"Убрать задание #{tid}?",
+               kb([btn("✅ Да, убрать", f"adm:tdelc:{tid}"), btn("↩️ Нет", f"adm:task:{tid}")]))
 
 
 @admin_router.callback_query(F.data.startswith("adm:tdelc:"))
 async def cb_task_del_confirm(cb: CallbackQuery):
     tid = tail_int(cb.data)
     ok = bool(tid) and db.delete_task(tid)
-    await show(
-        cb, f"🗑 Задание #{tid} убрано." if ok else "Задание не найдено.", kb([btn("⬅️ К списку", "adm:tasks")])
-    )
+    await show(cb, f"🗑 Задание #{tid} убрано." if ok else "Задание не найдено.",
+               kb([btn("⬅️ К списку", "adm:tasks")]))
 
 
 @admin_router.callback_query(F.data.startswith("adm:ttgt:"))
@@ -1325,11 +1423,7 @@ async def cb_task_bind(cb: CallbackQuery, state: FSMContext):
         return await cb.answer()
     await state.set_state(Bind.post)
     await state.update_data(tid=tid)
-    await show(
-        cb,
-        f"Сделай бота админом канала #{tid} и перешли сюда любой пост из него.",
-        kb([btn("❌ Отмена", "adm:tasks")]),
-    )
+    await show(cb, f"Перешли сюда любой пост из канала #{tid}.", kb([btn("❌ Отмена", "adm:tasks")]))
 
 
 @admin_router.message(Bind.post)
@@ -1344,8 +1438,7 @@ async def msg_bind(message: Message, state: FSMContext):
     ok = isinstance(tid, int) and db.set_chat_id(tid, chat_id)
     await message.answer(
         "✅ Канал привязан, включена автопроверка подписки." if ok else "❌ Задание не найдено.",
-        reply_markup=admin_menu(),
-    )
+        reply_markup=admin_menu())
 
 
 # ---------------------------------------------------------------- реклама
@@ -1406,18 +1499,13 @@ async def cb_ads(cb: CallbackQuery):
     rows = [[btn(f"🗑 Удалить #{aid} (до {tm(exp)})", f"adm:addel:{aid}")] for aid, exp in ads]
     rows.append([btn("➕ Новая реклама", "adm:adnew")])
     rows.append([btn("⬅️ В админ-панель", "adm")])
-    text = f"📢 <b>Реклама</b>\n\nАктивных: <b>{len(ads)}</b>"
-    await show(cb, text, kb(*rows))
+    await show(cb, f"📢 <b>Реклама</b>\n\nАктивных: <b>{len(ads)}</b>", kb(*rows))
 
 
 @admin_router.callback_query(F.data == "adm:adnew")
 async def cb_ad_new(cb: CallbackQuery, state: FSMContext):
     await state.set_state(AdForm.content)
-    await show(
-        cb,
-        "Отправь сообщение для рекламы (текст, фото или видео — как оно должно выглядеть).",
-        kb([btn("❌ Отмена", "adm:ads")]),
-    )
+    await show(cb, "Отправь сообщение для рекламы (текст, фото или видео).", kb([btn("❌ Отмена", "adm:ads")]))
 
 
 @admin_router.message(AdForm.content)
@@ -1447,8 +1535,7 @@ async def msg_ad_duration(message: Message, state: FSMContext):
         return await message.answer("❌ Не удалось показать превью. Начни заново.", reply_markup=admin_menu())
     n = len(db.all_user_ids())
     await message.answer(
-        f"Выше — превью. Разослать <b>{n}</b> пользователям на <b>{db.fmt_duration(sec)}</b>? "
-        "По истечении времени сообщения удалятся.",
+        f"Выше — превью. Разослать <b>{n}</b> пользователям на <b>{db.fmt_duration(sec)}</b>?",
         reply_markup=kb([btn("🚀 Разослать", "adm:adpost")], [btn("❌ Отмена", "adm")]),
     )
 
@@ -1464,8 +1551,7 @@ async def cb_ad_post(cb: CallbackQuery, state: FSMContext):
     started = time.monotonic()
     ok, fail = await broadcast_ad(cb.bot, ad_id, data["src_chat"], data["src_msg"])
     await safe_send(
-        cb.bot,
-        ADMIN_ID,
+        cb.bot, ADMIN_ID,
         f"✅ Реклама <b>#{ad_id}</b> разослана.\nУспешно: {ok}\nОшибок: {fail}\n"
         f"Время: {time.monotonic() - started:.1f} с\nСрок показа: {db.fmt_duration(data['duration'])}",
         reply_markup=admin_menu(),
@@ -1492,18 +1578,14 @@ async def sub_check_loop(bot: Bot):
                 if ok is False:
                     if db.mark_unsub(utid):
                         username, first_name = db.user_names(uid)
-                        await safe_send(
-                            bot, uid,
+                        await safe_send(bot, uid,
                             f"🔒 Ты отписался от канала #{tid} раньше чем через {SUB_HOLD_DAYS} дн. "
                             "после получения награды. Вывод звёзд заблокирован. "
-                            "Если это ошибка — напиши администратору.",
-                        )
-                        await safe_send(
-                            bot, ADMIN_ID,
+                            "Если это ошибка — напиши администратору.")
+                        await safe_send(bot, ADMIN_ID,
                             f"🔒 {user_label(uid, username, first_name)} отписался от канала #{tid} "
                             f"в течение {SUB_HOLD_DAYS} дн. Вывод заблокирован.",
-                            reply_markup=kb([btn("🔓 Снять блок", f"ub:{uid}")]),
-                        )
+                            reply_markup=kb([btn("🔓 Снять блок", f"ub:{uid}")]))
                 else:
                     db.touch_check(utid)
                 await asyncio.sleep(0.1)
@@ -1540,7 +1622,7 @@ async def main():
                 if member.status not in ("administrator", "creator"):
                     log.warning("Канал #%s: бот НЕ админ, проверка подписки не заработает", tid)
             except TelegramAPIError:
-                log.warning("Канал #%s: бот не видит chat_id %s (проверь, что он админ)", tid, chat_id)
+                log.warning("Канал #%s: бот не видит chat_id %s", tid, chat_id)
     added = db.seed_tasks()
     if added:
         log.info("Добавлено стартовых заданий: %s", added)

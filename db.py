@@ -7,6 +7,7 @@ from decimal import Decimal, InvalidOperation
 from config import DB_PATH, MIN_WITHDRAW, REF_REWARD, SEED_TARGET, SUB_HOLD_DAYS, TASK_REWARD
 
 SUB_CHECK_INTERVAL = 2 * 3600  # как часто перепроверять подписку (сек.)
+L2_REWARD = 10  # 0.10⭐ за реферала 2-го уровня
 
 _conn = sqlite3.connect(DB_PATH)
 _conn.execute("PRAGMA journal_mode=WAL")
@@ -79,6 +80,25 @@ _conn.executescript(
         status TEXT NOT NULL DEFAULT 'pending',
         created_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS spin_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        prize INTEGER NOT NULL,
+        spun_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS promocodes (
+        code TEXT PRIMARY KEY,
+        reward INTEGER NOT NULL,
+        uses_left INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS promo_uses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        code TEXT NOT NULL,
+        user_id INTEGER NOT NULL,
+        used_at INTEGER NOT NULL,
+        UNIQUE (code, user_id)
+    );
     CREATE TABLE IF NOT EXISTS meta (
         key TEXT PRIMARY KEY,
         value TEXT
@@ -92,6 +112,8 @@ for _sql in (
     "ALTER TABLE user_tasks ADD COLUMN approved_at INTEGER",
     "ALTER TABLE user_tasks ADD COLUMN last_check INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE user_tasks ADD COLUMN unsubscribed INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN last_spin INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN l2_ref_count INTEGER NOT NULL DEFAULT 0",
 ):
     try:
         _conn.execute(_sql)
@@ -162,7 +184,30 @@ def ensure_user(uid: int, username, first_name: str):
 
 def register_user(uid: int, username, first_name: str, referrer_id):
     with _conn:
-        if _conn.execute("SELECT 1 FROM users WHERE id=?", (uid,)).fetchone():
+        exists = _conn.execute("SELECT referrer_id FROM users WHERE id=?", (uid,)).fetchone()
+        if exists:
+            # Пользователь уже есть. Если реферер ещё не был задан — сохраняем его.
+            if referrer_id and referrer_id != uid and exists[0] is None:
+                ref = None
+                if _conn.execute(
+                    "SELECT 1 FROM users WHERE id=? AND banned=0", (referrer_id,)
+                ).fetchone():
+                    ref = referrer_id
+                if ref:
+                    _conn.execute("UPDATE users SET referrer_id=? WHERE id=?", (ref, uid))
+                    _conn.execute(
+                        "UPDATE users SET balance=balance+?, ref_count=ref_count+1 WHERE id=?",
+                        (REF_REWARD, ref),
+                    )
+                    l2_row = _conn.execute(
+                        "SELECT referrer_id FROM users WHERE id=?", (ref,)
+                    ).fetchone()
+                    if l2_row and l2_row[0] and l2_row[0] != uid:
+                        _conn.execute(
+                            "UPDATE users SET balance=balance+?, l2_ref_count=l2_ref_count+1 WHERE id=?",
+                            (L2_REWARD, l2_row[0]),
+                        )
+                    return True, ref
             return False, None
         ref = None
         if referrer_id and referrer_id != uid:
@@ -179,12 +224,20 @@ def register_user(uid: int, username, first_name: str, referrer_id):
                 "UPDATE users SET balance=balance+?, ref_count=ref_count+1 WHERE id=?",
                 (REF_REWARD, ref),
             )
+            l2_row = _conn.execute(
+                "SELECT referrer_id FROM users WHERE id=?", (ref,)
+            ).fetchone()
+            if l2_row and l2_row[0] and l2_row[0] != uid:
+                _conn.execute(
+                    "UPDATE users SET balance=balance+?, l2_ref_count=l2_ref_count+1 WHERE id=?",
+                    (L2_REWARD, l2_row[0]),
+                )
         return True, ref
 
 
 def get_user(uid: int):
     return _conn.execute(
-        "SELECT balance, ref_count, banned FROM users WHERE id=?", (uid,)
+        "SELECT balance, ref_count, banned, l2_ref_count FROM users WHERE id=?", (uid,)
     ).fetchone()
 
 
@@ -230,6 +283,14 @@ def adjust_balance(uid: int, delta: int):
 
 def all_user_ids():
     return [r[0] for r in _conn.execute("SELECT id FROM users WHERE banned=0")]
+
+
+def top_refs(limit: int = 10):
+    return _conn.execute(
+        "SELECT id, username, first_name, ref_count FROM users "
+        "WHERE ref_count > 0 ORDER BY ref_count DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
 
 
 _FREE = (
@@ -419,6 +480,32 @@ def claim_auto(uid: int, tid: int) -> str:
         return "ok"
 
 
+def _file_hash(file_id: str) -> str:
+    """Первые 32 символа file_id как отпечаток.
+    Telegram даёт разные file_id одного файла при пересылке,
+    но для одного и того же загруженного файла они совпадают
+    в пределах одного бота. Этого достаточно для базовой защиты."""
+    return file_id[:32] if file_id else ""
+
+
+def tiktok_duplicate(file_id: str) -> bool:
+    """True если такой file_id уже есть в принятых или ожидающих TikTok-скриншотах."""
+    h = _file_hash(file_id)
+    return bool(_conn.execute(
+        "SELECT 1 FROM tiktok_proofs WHERE proof_file_id LIKE ? AND status IN ('pending','approved')",
+        (h + "%",),
+    ).fetchone())
+
+
+def proof_duplicate(file_id: str) -> bool:
+    """True если такой file_id уже есть в принятых/ожидающих заданиях."""
+    h = _file_hash(file_id)
+    return bool(_conn.execute(
+        "SELECT 1 FROM user_tasks WHERE proof_file_id LIKE ? AND status IN ('pending','approved')",
+        (h + "%",),
+    ).fetchone())
+
+
 def submit_proof(uid: int, tid: int, file_id: str):
     with _conn:
         if is_banned(uid):
@@ -521,6 +608,14 @@ def withdrawal_history(limit: int = 20):
         "FROM withdrawals w LEFT JOIN users u ON u.id=w.user_id WHERE w.status!='pending' ORDER BY w.id DESC LIMIT ?",
         (limit,),
     ).fetchall()
+
+
+def user_pending_withdrawal(uid: int):
+    """Возвращает (id, amount) последней заявки на вывод в статусе pending, или None."""
+    return _conn.execute(
+        "SELECT id, amount FROM withdrawals WHERE user_id=? AND status='pending' ORDER BY id DESC LIMIT 1",
+        (uid,),
+    ).fetchone()
 
 
 def stats():
@@ -716,3 +811,89 @@ def pending_tiktoks(limit: int = 10):
         "WHERE tp.status='pending' ORDER BY tp.id LIMIT ?",
         (limit,),
     ).fetchall()
+
+
+# ------------------------------------------------------------ крутилка
+SPIN_PRIZES = [0, 5, 10, 50]        # 0 = ничего, в сотых долях звезды
+SPIN_WEIGHTS = [60, 25, 12, 3]      # 60% ничего, 25% → 0.05⭐, 12% → 0.10⭐, 3% → 0.50⭐
+SPIN_COOLDOWN = 86400                # 24 ч между кручениями
+
+
+def spin_available(uid: int) -> int:
+    """Возвращает 0 если можно крутить, иначе секунды до следующего кручения."""
+    row = _conn.execute("SELECT last_spin FROM users WHERE id=?", (uid,)).fetchone()
+    if not row:
+        return 0
+    left = (row[0] + SPIN_COOLDOWN) - now()
+    return max(0, left)
+
+
+def do_spin(uid: int) -> tuple:
+    """Крутит колесо. Возвращает (ok, prize_cents) или (False, seconds_left)."""
+    import random
+    with _conn:
+        wait = spin_available(uid)
+        if wait > 0:
+            return False, wait
+        prize = random.choices(SPIN_PRIZES, weights=SPIN_WEIGHTS, k=1)[0]
+        _conn.execute("UPDATE users SET last_spin=? WHERE id=?", (now(), uid))
+        if prize > 0:
+            _conn.execute("UPDATE users SET balance=balance+? WHERE id=?", (prize, uid))
+        _conn.execute(
+            "INSERT INTO spin_log(user_id, prize, spun_at) VALUES(?,?,?)", (uid, prize, now())
+        )
+        return True, prize
+
+
+# ------------------------------------------------------------ промокоды
+def create_promo(code: str, reward: int, uses: int) -> bool:
+    """False если код уже существует."""
+    with _conn:
+        try:
+            _conn.execute(
+                "INSERT INTO promocodes(code, reward, uses_left, created_at) VALUES(?,?,?,?)",
+                (code.upper(), reward, uses, now()),
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def delete_promo(code: str) -> bool:
+    with _conn:
+        return _conn.execute(
+            "DELETE FROM promocodes WHERE code=?", (code.upper(),)
+        ).rowcount > 0
+
+
+def list_promos():
+    return _conn.execute(
+        "SELECT code, reward, uses_left, created_at FROM promocodes ORDER BY created_at DESC"
+    ).fetchall()
+
+
+def use_promo(uid: int, code: str):
+    """Возвращает (status, reward_cents).
+    status: ok / notfound / used / expired"""
+    code = code.upper().strip()
+    with _conn:
+        row = _conn.execute(
+            "SELECT reward, uses_left FROM promocodes WHERE code=?", (code,)
+        ).fetchone()
+        if not row:
+            return "notfound", 0
+        if row[1] <= 0:
+            return "expired", 0
+        already = _conn.execute(
+            "SELECT 1 FROM promo_uses WHERE code=? AND user_id=?", (code, uid)
+        ).fetchone()
+        if already:
+            return "used", 0
+        _conn.execute(
+            "UPDATE promocodes SET uses_left=uses_left-1 WHERE code=?", (code,)
+        )
+        _conn.execute(
+            "INSERT INTO promo_uses(code, user_id, used_at) VALUES(?,?,?)", (code, uid, now())
+        )
+        _conn.execute("UPDATE users SET balance=balance+? WHERE id=?", (row[0], uid))
+        return "ok", row[0]
